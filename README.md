@@ -1,9 +1,9 @@
-# Сжатие Bzip2: этап 1
+# HTTP API Bzip2: этап 2
 
-CLI читает файл и выводит Bzip2 в stdout.
+Flask и XML, восемь маршрутов варианта 5.
+Очередь запускает CLI через subprocess.
 
 ```sh
-python -m src.compress examples/text.txt > text.bz2
-python -m src.examples
-python -m pytest tests/test_cli.py
+python -m src.server --backend memory
+python -m pytest
 ```

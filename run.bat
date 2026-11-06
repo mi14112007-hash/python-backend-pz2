@@ -1,2 +1,3 @@
 @echo off
-python -m src.compress %*
+cd /d "%~dp0"
+python -m src.server %*
