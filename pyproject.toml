@@ -1,0 +1,17 @@
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+omit = ["src/demo.py", "src/examples.py"]
+
+[tool.ruff]
+line-length = 79
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "C90"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
