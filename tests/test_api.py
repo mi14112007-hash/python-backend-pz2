@@ -1,20 +1,31 @@
-"""Independent dictionary oracle exercised exclusively by Hypothesis."""
+"""Hypothesis model tests, CLI, asynchronous execution and persistence."""
 
 import base64
+import bz2
+import io
+import subprocess
+import sys
+from http import HTTPStatus
+from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
+from unittest.mock import patch
 from urllib.parse import urlsplit
 
 import pytest
-from hypothesis import settings
+from hypothesis import given, settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
 
 from src.app import create_app
 from src.client import ApiClient
-from src.database import SQLiteStore
-from src.memory import MemoryStore
+from src.compress import compress_file
+from src.db import MemoryStore, SQLiteStore
 
 NOW = 2000000
+MISSING_IDENTIFIER = 999999
+MIN_DURATION_MS = 0
+REPORT_WINDOW_SECONDS = 9 * 60
 TEXT = st.sampled_from(["ru-RU", "en-US", '<&> quotes "', ""])
 
 
@@ -90,7 +101,7 @@ class ApiMachine(RuleBasedStateMachine):
         assert result["state"] == "done"
         assert result["output"] == result["failure"] == ""
         assert result["query"] == record["identifier"]
-        assert result["duration"] >= 0
+        assert result["duration"] >= MIN_DURATION_MS
 
     @rule(index=st.integers(0, 100), offset=st.integers(-600, 5))
     def adjust_query(self, index, offset):
@@ -104,11 +115,11 @@ class ApiMachine(RuleBasedStateMachine):
     @rule()
     def missing_references(self):
         with pytest.raises(ValueError):
-            self.api.query_register(person=999999, content="")
+            self.api.query_register(person=MISSING_IDENTIFIER, content="")
         with pytest.raises(ValueError):
-            self.api.person_adjust(999999, locale="ru-RU")
+            self.api.person_adjust(MISSING_IDENTIFIER, locale="ru-RU")
         with pytest.raises(ValueError):
-            self.api.query_adjust(999999, content="")
+            self.api.query_adjust(MISSING_IDENTIFIER, content="")
 
     @rule(
         field=st.sampled_from(["Accept", "Accept-Language"]),
@@ -142,7 +153,7 @@ class ApiMachine(RuleBasedStateMachine):
         reply = self.http.post(
             "/api/register/person", data=payload, headers=self.api.headers
         )
-        assert reply.status_code == 200
+        assert reply.status_code == HTTPStatus.OK
         assert b"<error>" in reply.data
 
     @rule()
@@ -163,7 +174,7 @@ class ApiMachine(RuleBasedStateMachine):
                 self.api.person_adjust(1)
         if self.queries:
             with pytest.raises(ValueError):
-                self.api.query_adjust(1, person=999999)
+                self.api.query_adjust(1, person=MISSING_IDENTIFIER)
 
     @invariant()
     def compare_tables_and_report(self):
@@ -177,13 +188,13 @@ class ApiMachine(RuleBasedStateMachine):
         pairs = {
             (self.people[q["person"]]["locale"], q["content"])
             for q in self.queries.values()
-            if q["time"] > NOW - 540
+            if q["time"] > NOW - REPORT_WINDOW_SECONDS
         }
         assert self.api.report_browse() == [
             dict(locale=locale, content=content)
             for locale, content in sorted(pairs)
         ]
-        assert self.api.result_browse(999999) == []
+        assert self.api.result_browse(MISSING_IDENTIFIER) == []
 
     def teardown(self):
         self.app.extensions["jobs"].close()
@@ -197,8 +208,113 @@ class SQLiteMachine(ApiMachine):
 
 
 TestMemory = ApiMachine.TestCase
+
+
 TestSQLite = SQLiteMachine.TestCase
+
+
 TestMemory.settings = settings(
     max_examples=30, stateful_step_count=35, deadline=None
 )
+
+
 TestSQLite.settings = TestMemory.settings
+
+
+@given(st.binary(max_size=10000))
+@settings(max_examples=20, deadline=None)
+def test_cli_roundtrip(data):
+    with TemporaryDirectory() as folder:
+        source = Path(folder) / "source"
+        source.write_bytes(data)
+        output = io.BytesIO()
+        compress_file(source, output)
+        assert bz2.decompress(output.getvalue()) == data
+        process = subprocess.run(
+            [sys.executable, "-m", "src.compress", str(source)],
+            capture_output=True,
+            check=True,
+        )
+        assert process.stdout == output.getvalue()
+        missing = subprocess.run(
+            [sys.executable, "-m", "src.compress", str(source) + ".missing"],
+            capture_output=True,
+        )
+        assert missing.returncode and missing.stderr
+        assert missing.stdout == b""
+
+
+def local_client(app):
+    """Adapt a Flask transport while keeping serialization in ApiClient."""
+    http = app.test_client()
+
+    def transport(method, url, data, headers):
+        parts = urlsplit(url)
+        reply = http.open(
+            parts.path, method=method, data=data, headers=headers
+        )
+        return reply.status_code, reply.data
+
+    return ApiClient(transport=transport)
+
+
+@given(data=st.binary(max_size=1000), sql=st.booleans(), bad=st.booleans())
+@settings(max_examples=12, deadline=None)
+def test_background_and_persistence(data, sql, bad):
+    with TemporaryDirectory() as folder:
+        path = str(Path(folder) / "data.sqlite")
+        store = SQLiteStore(path) if sql else MemoryStore()
+        app = create_app(store)
+        api = local_client(app)
+        person = api.person_register(locale="ru-RU", user_agent="test")
+        content = "!" if bad else base64.b64encode(data).decode("ascii")
+        query = api.query_register(
+            person=person["identifier"], content=content
+        )
+        app.extensions["jobs"].drain()
+        result = api.result_browse(query["identifier"])[0]
+        if bad:
+            assert result["state"] == "failed" and result["failure"]
+        else:
+            assert result["state"] == "done"
+            assert bz2.decompress(base64.b64decode(result["output"])) == data
+        app.extensions["jobs"].close()
+        if sql:
+            restored = SQLiteStore(path)
+            assert restored.browse("result", {}) == [result]
+            restored.close()
+
+
+@given(st.binary(max_size=100))
+@settings(max_examples=5, deadline=None)
+def test_http_returns_before_compression_finishes(data):
+    app = create_app()
+    api = local_client(app)
+    jobs = app.extensions["jobs"]
+    release = Event()
+    entered = Event()
+    compress = jobs._compress
+
+    def delayed(content):
+        entered.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("HTTP request waited for the job")
+        return compress(content)
+
+    try:
+        with patch.object(jobs, "_compress", delayed):
+            person = api.person_register(locale="ru-RU", user_agent="test")
+            content = base64.b64encode(data).decode("ascii")
+            query = api.query_register(
+                person=person["identifier"], content=content
+            )
+            assert entered.wait(timeout=2)
+            running = api.result_browse(query["identifier"])[0]
+            assert running["state"] == "running"
+            release.set()
+            jobs.drain()
+            result = api.result_browse(query["identifier"])[0]
+            assert bz2.decompress(base64.b64decode(result["output"])) == data
+    finally:
+        release.set()
+        jobs.close()

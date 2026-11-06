@@ -2,7 +2,7 @@
 
 from xml.etree import ElementTree as ET
 
-from src.schema import SCHEMAS
+from src.db import SCHEMAS
 
 
 def encode(tag, values):

@@ -1,14 +1,85 @@
-"""The eight XML HTTP handlers required by variant five."""
+"""Asynchronous Bzip2 jobs, XML HTTP handlers and Flask server."""
 
-from time import time
+import argparse
+import atexit
+import base64
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from http import HTTPStatus
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from time import monotonic, time
 from xml.etree.ElementTree import ParseError
 
 from flask import Flask, Response, request
 
-from src.jobs import JobQueue
-from src.memory import MemoryStore
-from src.schema import SCHEMAS
+from src.db import SCHEMAS, MemoryStore, SQLiteStore
 from src.xmlio import decode, encode
+
+CLI_PATH = Path(__file__).with_name("compress.py")
+TIMEOUT_SECONDS = 30
+MILLISECONDS = 1000
+FILTER_VALUE_COUNT = 1
+
+
+class JobQueue:
+    """Run one compression at a time without blocking HTTP responses."""
+
+    def __init__(self, store, fake=False):
+        self.store = store
+        self.fake = fake
+        self.executor = ThreadPoolExecutor(max_workers=1)
+
+    def submit(self, query):
+        """Persist a queued result before scheduling a task snapshot."""
+        result = self.store.add(
+            "result",
+            dict(
+                time=int(time()),
+                output="",
+                state="queued",
+                failure="",
+                query=query["identifier"],
+                duration=0,
+            ),
+        )
+        self.executor.submit(self._run, query, result["identifier"])
+        return result
+
+    def _run(self, query, identifier):
+        started = monotonic()
+        self.store.adjust("result", identifier, {"state": "running"})
+        try:
+            output = "" if self.fake else self._compress(query["content"])
+            changes = dict(state="done", output=output, failure="")
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            changes = dict(state="failed", output="", failure=str(error))
+        changes["duration"] = int((monotonic() - started) * MILLISECONDS)
+        changes["time"] = int(time())
+        self.store.adjust("result", identifier, changes)
+
+    def _compress(self, content):
+        with TemporaryDirectory() as folder:
+            source = Path(folder) / "input"
+            source.write_bytes(base64.b64decode(content, validate=True))
+            process = subprocess.run(
+                [sys.executable, str(CLI_PATH), str(source)],
+                capture_output=True,
+                timeout=TIMEOUT_SECONDS,
+                check=True,
+            )
+            return base64.b64encode(process.stdout).decode("ascii")
+
+    def drain(self):
+        """Wait for all already submitted tasks, keeping the queue open."""
+        self.executor.submit(lambda: None).result()
+
+    def close(self):
+        """Finish pending tasks before closing the data layer."""
+        self.executor.shutdown(wait=True)
+        self.store.close()
+
 
 HEADERS = {"Accept": "text/xml", "Accept-Language": "ru-RU"}
 
@@ -42,7 +113,11 @@ def check_headers():
     """Check required header values in the order of the assignment."""
     for name, value in HEADERS.items():
         if request.headers.get(name) != value:
-            return response("error", {"message": f"Required: {name}"}, 406)
+            return response(
+                "error",
+                {"message": f"Required: {name}"},
+                HTTPStatus.NOT_ACCEPTABLE,
+            )
     return None
 
 
@@ -55,7 +130,10 @@ def filters(entity, fixed=None):
     """Convert query-string filters using the entity field types."""
     values = {}
     for key in request.args:
-        if key not in SCHEMAS[entity] or len(request.args.getlist(key)) != 1:
+        if (
+            key not in SCHEMAS[entity]
+            or len(request.args.getlist(key)) != FILTER_VALUE_COUNT
+        ):
             raise ValueError("Unknown or repeated search field")
         values[key] = SCHEMAS[entity][key](request.args[key])
     if fixed:
@@ -126,3 +204,23 @@ def adjust(store, entity):
         raise ValueError("Identifier is required")
     identifier = values.pop("identifier")
     return response(entity, store.adjust(entity, identifier, values))
+
+
+def main():
+    """Start a local server with an explicitly selected persistence mode."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--backend", choices=["memory", "sqlite"], default="sqlite"
+    )
+    parser.add_argument("--database", default="data.sqlite")
+    parser.add_argument("--port", type=int, default=5005)
+    parser.add_argument("--fake", action="store_true")
+    args = parser.parse_args()
+    store = SQLiteStore(args.database) if args.backend == "sqlite" else None
+    app = create_app(store, args.fake)
+    atexit.register(app.extensions["jobs"].close)
+    app.run(host="127.0.0.1", port=args.port, use_reloader=False)
+
+
+if __name__ == "__main__":
+    main()

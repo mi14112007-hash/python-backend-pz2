@@ -1,6 +1,7 @@
 """HTTP client with table_action method names and injectable transport."""
 
 import base64
+from http import HTTPStatus
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -38,7 +39,7 @@ class ApiClient:
         status, body = self.transport(
             method, self.url + path, data, self.headers
         )
-        if status != 200:
+        if status != HTTPStatus.OK:
             raise ValueError(f"HTTP {status}: {body.decode('utf-8')}")
         return unpack(body)
 

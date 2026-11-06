@@ -1,7 +1,8 @@
-"""Compress an input file and write Bzip2 bytes to standard output."""
+"""Compress input files to Bzip2 stdout and demonstrate four examples."""
 
 import argparse
 import bz2
+import subprocess
 import sys
 from pathlib import Path
 
@@ -26,6 +27,22 @@ def main():
         compress_file(args.input, sys.stdout.buffer)
     except OSError as error:
         parser.exit(1, f"{error}\n")
+
+
+def examples():
+    """Create output artifacts outside version control."""
+    destination = Path("results")
+    destination.mkdir(exist_ok=True)
+    for source in sorted(Path("examples").iterdir()):
+        process = subprocess.run(
+            [sys.executable, "-m", "src.compress", str(source)],
+            capture_output=True,
+            check=True,
+        )
+        original = source.read_bytes()
+        assert bz2.decompress(process.stdout) == original
+        (destination / (source.name + ".bz2")).write_bytes(process.stdout)
+        print(f"{source.name}: {len(original)} -> {len(process.stdout)} bytes")
 
 
 if __name__ == "__main__":
