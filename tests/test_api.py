@@ -11,6 +11,7 @@ from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
 
 from src.app import create_app
 from src.client import ApiClient
+from src.database import SQLiteStore
 from src.memory import MemoryStore
 
 NOW = 2000000
@@ -25,7 +26,11 @@ class ApiMachine(RuleBasedStateMachine):
     def __init__(self):
         super().__init__()
         self.folder = TemporaryDirectory()
-        store = MemoryStore()
+        store = (
+            MemoryStore()
+            if self.backend == "memory"
+            else SQLiteStore(self.folder.name + "/data.sqlite")
+        )
         self.app = create_app(store, fake=True, clock=lambda: NOW)
         self.http = self.app.test_client()
         self.api = ApiClient(transport=self.transport)
@@ -185,5 +190,15 @@ class ApiMachine(RuleBasedStateMachine):
         self.folder.cleanup()
 
 
+class SQLiteMachine(ApiMachine):
+    """Run the identical model against a persistent SQL data layer."""
+
+    backend = "sqlite"
+
+
 TestMemory = ApiMachine.TestCase
-TestMemory.settings = settings(max_examples=30, stateful_step_count=35, deadline=None)
+TestSQLite = SQLiteMachine.TestCase
+TestMemory.settings = settings(
+    max_examples=30, stateful_step_count=35, deadline=None
+)
+TestSQLite.settings = TestMemory.settings
